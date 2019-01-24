@@ -193,7 +193,7 @@ resp, err = pconn.roundTrip(treq)
 for alive {
 	...... 
 	// 试探性的读一个字节
-	_, err := pc.br.Peek(1)
+	_, err := pc.br.Peek(1) 【标注点 6】
 	......
 	
 	// 接收来自roundTrip的信息
@@ -211,7 +211,7 @@ for alive {
 
 }
 ```
-### 为什么要关闭resp.Close()
+### net/http::Response.Close()
 
 [stackoverflow: What could happen if I don't close response.Body in golang?
 ](https://stackoverflow.com/questions/33238518/what-could-happen-if-i-dont-close-response-body-in-golang)
@@ -299,9 +299,9 @@ func (es *bodyEOFSignal) Read(p []byte) (n int, err error) {
                 return err
             },
 ```
-condfn也调用fn返回错误，waitForBodyRead为false，这时候连接不会被重用了，连接中的定时器超时后会关闭底层连接(net.Conn)
+condfn也调用fn返回错误，waitForBodyRead为false，这时候连接不会被重用了，连接中的定时器超时后会关闭底层连接(net.Conn), 这种情况下执行了resp.Body.Close()会走到下面代码【标注点 5】这时候执行es.earlyCloseFn()也没有任何意义了，毕竟readLoop()已经退出了。
 
-综上，只要发生了读取动作，没有执行resp.Body.Close()，没有什么影响。那就来看看Close的实现代码：
+综上，只要发生了读取动作，没有执行resp.Body.Close()，没有什么影响。Close的实现代码：
 
 ```
 func (es *bodyEOFSignal) Close() error {
@@ -314,13 +314,13 @@ func (es *bodyEOFSignal) Close() error {
     es.closed = true
 
     if es.earlyCloseFn != nil && es.rerr != io.EOF {
-        return es.earlyCloseFn()
+        return es.earlyCloseFn() 【标注点 5】
     }
     err := es.body.Close()
     return es.condfn(err)
 }
 ```
-如果没有读取Body的行为，这里会走到es.earlyCloseFn()，readLoop会跳出，连接不会被re-use，如果读取过Body，也执行了Close(), es.body.Close()会返回的是nil，而不是io.EOF，condfn不会调用fn，读取Body的过程中已经调用了fn。在net/http/client.go中注释中有这样一句话，感觉是不对的：
+如果没有读取Body的行为，这里会走到es.earlyCloseFn()，readLoop会跳出，连接不会被re-use，如果读取过Body，也执行了Close(),正常读取（io.EOF)会走到es.body.Close()会返回的是nil，而不是io.EOF，condfn不会调用fn，读取Body的过程中已经调用了fn。在net/http/client.go中注释中有这样一句话，感觉是不对的：
 
 ```
 470 // Body which the user is expected to close. If the Body is not
@@ -328,4 +328,202 @@ func (es *bodyEOFSignal) Close() error {
 472 // may not be able to re-use a persistent TCP connection to the server
 473 // for a subsequent "keep-alive" request.
 ```
+
 ## 重试逻辑
+
+shuldRetryRequest中判断是否要对Request进行重试有很多分支，下面重点介绍几个，其他可以自己分析。
+
+```
+func (pc *persistConn) shouldRetryRequest(req *Request, err error) bool {
+	 ......
+	 if !pc.isReused() {	//链接被reuse， return false
+	 	 return false
+	 }
+
+	......
+	
+	if !req.isReplayable() {
+        // Don't retry non-idempotent requests.
+        return false
+    }
+    if _, ok := err.(transportReadFromServerError); ok {
+        // We got some non-EOF net.Conn.Read failure reading
+        // the 1st response byte from the server.
+        return true
+    }
+    ......
+}
+```
+transportReadFromServerError错误是在【标注点 6】Peek操作可能产生的，Peek并不改变读取的位置(相当于文件句柄并没有偏移，操作的仅仅是reader，而不是操作系统的文件句柄），这种情况下会重试。
+这里重点来看一下，isReplayable()这里有判断使用的判断, 在[net/http/httputil: ReverseProxy](https://github.com/golang/go/issues/16036)中介绍了利用反向代理向服务端发送请求的情况（Body != nil && ContentLength == 0), 因此在实现反向代理的时候需要注意这一点。
+
+```
+// in file: net/http/request.go
+1309 func (r *Request) isReplayable() bool {
+1310     if r.Body == nil || r.Body == NoBody || r.GetBody != nil {
+1311         switch valueOrDefault(r.Method, "GET") {
+1312         case "GET", "HEAD", "OPTIONS", "TRACE":
+1313             return true
+1314         }
+1315     }
+1316     return false
+1317 }
+```
+当然走到这里并不是万事大吉了，还有个GetBody存在，在RoundTrip的最后代码：
+
+```
+		// Rewind the body if we're able to.  (HTTP/2 does this itself so we only
+		// need to do it for HTTP/1.1 connections.)
+        if req.GetBody != nil && pconn.alt == nil {
+            newReq := *req
+            var err error
+            newReq.Body, err = req.GetBody()
+            if err != nil {
+                return nil, err
+            }
+            req = &newReq
+        }
+```
+从代码上看要使用GetBody()重新构造请求，为什么要重新构造请求呢？
+个人在实现网关的http反向代理过程中，在RoundTrip()实现重试，在第一次请求失败过程，第二次重新发送请求的时候，会返回这个错误：
+
+```go
+//definition in file: net/http/transfer.go
+var ErrBodyReadAfterClose = errors.New("http: invalid Read on closed Body")
+```
+在Request定义中, Body是一个io.ReadCloser interface，Reqeust相关代码如下：
+
+```
+type Reqeust struct {
+	 ......
+    // Body is the request's body.
+    //
+    // For client requests a nil body means the request has no
+    // body, such as a GET request. The HTTP Client's Transport
+    // is responsible for calling the Close method.
+    //
+    // For server requests the Request Body is always non-nil
+    // but will return EOF immediately when no body is present.
+    // The Server will close the request body. The ServeHTTP
+    // Handler does not need to.
+    Body io.ReadCloser
+
+    // GetBody defines an optional func to return a new copy of
+    // Body. It is used for client requests when a redirect requires
+    // reading the body more than once. Use of GetBody still
+    // requires setting Body.
+    //
+    // For server requests it is unused.
+    GetBody func() (io.ReadCloser, error)
+    ......
+}
+```
+**在构造并发送请求后，Body会被自动关闭，且只能被读取一次**。在RoundTrip中调用链如下(RoundTrip还有其他异常Close的地方，调用的是http.Request.closeBody()->Request.Body.Close(), 都是一致的代码)：
+
+net/http.(\*persistConn).writeLoop() -> net/http.(\*Request).write() -> net/http.(*transferWriter).WriteBody()
+
+```go
+// in file: net/http/transfer.go
+func (t *transferWriter) WriteBody(w io.Writer) error {
+
+		 } else if t.ContentLength == -1 {
+            ncopy, err = io.Copy(w, body)
+        }
+	......
+	if t.BodyCloser != nil {
+        if err := t.BodyCloser.Close(); err != nil {
+            return err
+        }
+    }
+    【标注点 8】
+    if !t.ResponseToHEAD && t.ContentLength != -1 && t.ContentLength != ncopy {
+        return fmt.Errorf("http: ContentLength=%d with Body length %d",
+            t.ContentLength, ncopy)
+    }
+	 ......
+}
+```
+读过之后会关闭，当然这里是多态的形式，Body的具体类型可能是http.body, http.noBody(GET等请求)或者使用ioutil.NopCloser包装的ioutil.nopCloser类型等，所以这里得到并且标准库中也明确说明：***`client的Request.Body会被关闭`***。
+接下来看一下http.body的Read(), 毕竟是一个ReadCloser，也是Reader。
+
+```
+ 764 func (b *body) Read(p []byte) (n int, err error) {
+ 765     b.mu.Lock()
+ 766     defer b.mu.Unlock()
+ 767     if b.closed {
+ 768         return 0, ErrBodyReadAfterClose 【标注点 7】
+ 769     }
+ 770     return b.readLocked(p)	【标注点 9】
+ 771 }
+ 
+ 774 func (b *body) readLocked(p []byte) (n int, err error) {
+ 775     if b.sawEOF {
+ 776         return 0, io.EOF
+ 777     }
+ 778     n, err = b.src.Read(p)
+ 779
+ 780     if err == io.EOF {
+ 781         b.sawEOF = true	// 不能重复读取
+     		......
+     }
+ 
+```
+所以，关闭之后再次读取就会走到【标注点 7】，这就说明了ErrBodyReadAfterClose的产生整个过程。
+
+第一次看到这个错误，没有去深刻理解，参考[router: fix request retries with bodies](https://github.com/flynn/flynn/pull/875)把Request给wrap一下，Close()不做任何操作，自己手动调用RealClose()进行关闭，进而有出现如下的错误：
+
+```
+http: ContentLength=238 with Body length 0
+```
+产生错误代码参见【标注点 8】，虽然没有真正的关闭，跳过【标注点 7】，但是不能第二次读取了，参见【标注点 9】
+
+另外仔细看了一下构建Request的代码如下，这里并没有全部深拷贝，Body是个interface，浅拷贝：
+
+```
+// in file: net/http/request.go
+// WithContext returns a shallow copy of r with its context changed
+// to ctx. The provided ctx must be non-nil.
+func (r *Request) WithContext(ctx context.Context) *Request {
+    if ctx == nil {
+        panic("nil context")
+    }
+    r2 := new(Request)
+    *r2 = *r
+    r2.ctx = ctx
+
+    // Deep copy the URL because it isn't
+    // a map and the URL is mutable by users
+    // of WithContext.
+    if r.URL != nil {
+        r2URL := new(url.URL)
+        *r2URL = *r.URL
+        r2.URL = r2URL
+    }
+
+    return r2
+}
+```
+
+所以，要正确的实现重试：**RoundTrip的重试，正确的实现GetBody()；外围重试要正确构建Request**。
+[router: fix request retries with bodies](https://github.com/flynn/flynn/pull/875)实现的内容在标准库有类似的：[ioutil.NopCloser](https://github.com/golang/go/blob/master/src/io/ioutil/ioutil.go#L118)正确的思路大致如下：
+
+```
+//bodyToBufer can be read repeatedly
+bodyToBuffer := Read(http.Request) or buffer_repeatedly_readable
+
+getBody := func() (io.ReadCloser, error) {
+	return ioutil.NopCloser(strings.NewReader(body)), nil
+}
+
+bodyReader, _ := getBody()
+
+/* 
+req, err := http.NewRequest(xxxHTTPMethod, xxxUrl, bodyReader)
+if err != nil {		
+	return nil, errors.Wrap(err, "creating request")
+}
+Or other NewRequest Method
+*/
+
+req.GetBody = getBody		
+```
