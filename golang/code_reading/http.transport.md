@@ -37,7 +37,7 @@ type Transport struct {
 2. Proxy的内部这里也不做过多介绍(socks5/http/https)
 3. RegisterProtocol可以注册新的协议scheme，相当于http协议上的一层协议，请求会转给注册scheme的RoundTripper而不走http的RoundTrip，具体使用可以参考标准库net/http/filetransport.go, net/http/h2_bundle.go有http/2的实现，https的内容涉及DialTLS的调用将会建立一个TLS的链接，这里不对https和http/2做过多介绍。
 
-## 获取链接
+## 1. 获取链接
 `getConn` 根据connectMethod获取或者创建一个\*persistConn, 连接池结构是这样的:idleConn map[connectMethodKey][]\*persistConn。其中connectMethodKey根据connectMethod生成的：`type connectMethodKey struct {proxy, scheme, addr string}`, map的值是一个*persistConn类型的slice结构，这里就是存放连接的地方，slice的length由MaxIdleConnsPerHost指定的，默认值为：`const DefaultMaxIdleConnsPerHost = 2`
 
 ```
@@ -95,7 +95,7 @@ getIdleConn函数for死循环内根据connectMethod生成key获取t.idleConn(连
 
 如果getIdleConn获取到一个空闲链接，那么getConn函数将返回这个链接以供外面使用。如果没有获取到合适的空闲链接，那么接下来就需要创建一条新的链接。
 
-###启动一个goroutine创建一个新的连接
+###1.1 启动一个goroutine创建一个新的连接
 
 ```
     go func() {
@@ -111,7 +111,7 @@ t.dialConn中调用Transport::dial()，网络连接通过Dialer.DialContext(注�
     go pconn.readLoop()
     go pconn.writeLoop()
 ```
-readLoop主要是读取从server返回的数据,writeLoop主要发送请求到server, 后续再详细介绍。
+这里br和bw包装了一下获得的连接pconn，然后启动了读和写循环，readLoop主要是读取从server返回的数据,writeLoop主要发送请求到server, 后续再详细介绍。
 创建后的连接发送到channel dialc中，等待接收。
 
 根据connectMethod获取对应的idleConnCh，如果不存在则创建一个空的idleConnCh，需要再一次强调：**`DisableKeepAlives被置为true，idleConnCh逻辑都不生效`**。
@@ -168,17 +168,20 @@ pconn.idleTimer = time.AfterFunc(t.IdleConnTimeout, pconn.closeConnIfStillIdle)
     // Zero means no limit.
     IdleConnTimeout time.Duration
 ```
+###1.2 获取链接过程总结###
+
 整个获取链接的过程大致如下图所示。
 
 ![getConn](https://github.com/GenuineJyn/genuinejyn.github.io/blob/master/pictures/getConn.png)
 
-## 完成发送和接收通信过程 
-发送请求，接收响应在获取的连接上完成, 如下。在前面讲过创建每一个连接的时候同时启动了两个goroutine：readLoop和writeLoop，需要跟roundTrip通过管道配合完成。
+
+## 2 完成发送和接收通信过程 
+获取可用的连接后，发送请求，接收响应就在获取的连接上完成, 如下。
 
 ```
 resp, err = pconn.roundTrip(treq)
 ```
-接下来看一下roundTrip内部的关键实现。
+在前面讲过创建每一个连接的时候同时启动了两个goroutine：readLoop和writeLoop，需要跟roundTrip通过channel配合完成，这个配合过程巧妙的使用大量的channel。接下来看一下roundTrip内部的关键实现。
 
 ```
     writeErrCh := make(chan error, 1)
@@ -197,13 +200,16 @@ resp, err = pconn.roundTrip(treq)
 首先看pc.writech channel, roundTrip发送数据，在writeLoop接收数据，writeLoop接收到数据后主要做了三件事情：
 
 ```
-	 err = pc.bw.Flush()
+	 err := wr.req.Request.write(pc.bw, pc.isProxy, wr.req.extra, pc.waitForContinue(wr.conti     nueCh))
+	 if err == nil {
+	 	err = pc.bw.Flush()
+	 }
 	 ......
 	 pc.writeErrCh <- err 【标注点 3】
 	 wr.ch <- err
 ```
 
-连接通过bufio.Writer.Flush()将请求写到连接发送给服务端，`wr.ch <- err`将错误或nil反馈给roundTrip, `pc.writeErrCh <- err`哪里接收后面会讲到，这里可以看到roundTrip->writeLoop()->remote_server完成全双工的写的过程, 跟随wc.ch回到roundTrip中继续看, 在RoundTrip最后是一个for死循环套着一个select语句，select中接收各种channel的信息，并作出相应的响应，对于wc.ch对应的是select中的`case err := <-writeErrCh`,如果err != nil关闭连接返回适当的错误信息。
+将请求写到连接发送给服务端，`wr.ch <- err`将错误或nil反馈给roundTrip, `pc.writeErrCh <- err`, readLoop会接收，这里可以看到roundTrip->writeLoop()->remote_server完成全双工的写的过程, 跟随wc.ch回到roundTrip中继续看, 在RoundTrip最后是一个for死循环套着一个select语句，select中接收各种channel的信息，并作出相应的响应，对于wc.ch对应的是select中的`case err := <-writeErrCh`,如果err != nil关闭连接返回适当的错误信息。
 
 继续, readLoop()主要是从服务端读回response，主要逻辑如下：
 
@@ -229,12 +235,12 @@ for alive {
 
 }
 ```
-### net/http::Response.Close()
+### 2.1 net/http::Response.Close()
 
 [stackoverflow: What could happen if I don't close response.Body in golang?
 ](https://stackoverflow.com/questions/33238518/what-could-happen-if-i-dont-close-response-body-in-golang)
 
-stackoverflow上的这个问题有比较概括性的回答, 但是也没有说明白，这里做一点代码级别的说明，回到上边讲到的【标注点 1】具体来看看，代码如下：
+stackoverflow上的这个问题有比较概括性的回答, 但是也没有说明白，很多其他forum也基本都是类似情况，只能看看具体内容，并得出了“诡异”的结论，回到上边讲到的【标注点 1】具体来看看，代码如下：
 
 ```
         body := &bodyEOFSignal{
@@ -261,7 +267,7 @@ stackoverflow上的这个问题有比较概括性的回答, 但是也没有说�
         
         resp.Body = body
 ```
-可以看出resp.Body的实际类型是bodyEOFSignal指针, 而bodyEOFSignal中body的wrap了一个http.body的指针，在bodyEOFSignal有两个Closure：earlyCloseFn/fn, 其中都会发送消息到waitForBodyRead之后都会阻塞在eofc，而eofc是defer close(eofc)只有等退出readLoop()才会被执行到，或者在下面的case中被发送，再看看【标注点 2】代码
+可以看出resp.Body的实际类型是`*bodyEOFSignal`, 而bodyEOFSignal中body的wrap了一个`*http.body`，在bodyEOFSignal有两个Closure：earlyCloseFn/fn, 其中都会发送消息到waitForBodyRead之后都会阻塞在eofc，而eofc是defer close(eofc)只有等退出readLoop()才会被执行到，或者在下面的case中被发送，再看看**【标注点 2】**代码, 代码如下。
 
 ```
 select {
@@ -286,7 +292,7 @@ select {
         }
 ```
 代码是阻塞在这里的，等待其中一个得到满足，而waitForBodyRead是通过earlyCloseFn/fn来发送的
-bodyEOFSignal::Read中会调用到bodyEOFSignal::condfn()调用到fn, 读完会发送eofc保证fn退出，之前说到的【标注点 3】也会在pc.wroteRequest()中接收，如果之前写有error，会返回false，也就是读结果的操作没有比较进行, tryPutIdleConn也是一个closure，会调用Transport:: tryPutIdleConn(), 前面提到的putOrCloseIdleConn也是代用这个方法，尝试把链接放到连接池，也就是这表明读完响应数据后把连接释放供后续使用。
+bodyEOFSignal::Read中会调用到bodyEOFSignal::condfn()调用到fn, 读完会发送eofc保证fn退出，之前说到的【标注点 3】会在pc.wroteRequest()中接收，如果之前写有error，会返回false，也就是读结果的操作没有必要进行, tryPutIdleConn也是一个closure，会调用Transport:: tryPutIdleConn(), 前面提到的putOrCloseIdleConn也是调用这个方法，尝试把链接放到连接池或idleConnCh，也就是这表明读完响应数据后把连接供后续使用。
 
 我们来看看读取数据的过程:
 
@@ -300,7 +306,7 @@ func (es *bodyEOFSignal) Read(p []byte) (n int, err error) {
     }
 }
 ```
-每次正常读取数据，最后err == io.EOF都会调用fn, 如果正常的话，会走到【标注点 4】，也会把连接放回连接池等待使用，alive也是true，readLoop继续执行，这时候不关闭Close实际并没有什么影响，可以去net/http/transfer.go中看看body::Close()实现。如果读取错误(!= io.EOF)
+每次正常读取数据，最后err == io.EOF都会调用fn, 如果正常的话，会走到【标注点 4】，也会把连接放回连接池等待使用，alive也是true，readLoop继续执行，这时候不执行resp.Body.Close()实际并没有什么影响，可以去net/http/transfer.go中看看body::Close()实现。如果读取错误(!= io.EOF)
 
 ```
 			  fn: func(err error) error {
@@ -338,7 +344,7 @@ func (es *bodyEOFSignal) Close() error {
     return es.condfn(err)
 }
 ```
-如果没有读取Body的行为，这里会走到es.earlyCloseFn()，readLoop会跳出，连接不会被re-use，如果读取过Body，也执行了Close(),正常读取（io.EOF)会走到es.body.Close()会返回的是nil，而不是io.EOF，condfn不会调用fn，读取Body的过程中已经调用了fn。在net/http/client.go中注释中有这样一句话，感觉是不对的：
+**继续分析**：如果没有读取Body的行为，这里会走到es.earlyCloseFn()，readLoop会跳出，连接不会被re-use，如果读取过Body，也执行了Close(),正常读取（io.EOF)会走到es.body.Close()会返回的是nil，而不是io.EOF，condfn不会调用fn，读取Body的过程中已经调用了fn。在net/http/client.go中注释中有这样一句话，感觉是不对的：
 
 ```
 470 // Body which the user is expected to close. If the Body is not
@@ -347,8 +353,49 @@ func (es *bodyEOFSignal) Close() error {
 473 // for a subsequent "keep-alive" request.
 ```
 
-## 重试逻辑
+resp.Body.Close()的最后读取数据并discard body剩余的数据（顺便提一句：需要判断resp.Body是否是nil，有可能会panic）
 
+```go
+// in file: net/http/transfer.go
+946		_, err = io.Copy(ioutil.Discard, bodyLocked{b})
+```
+
+resp.Body.Close()与是否re-use连接没有什么直接联系，欢迎argue，mail: genuinejyn@gmail.com。
+
+### 2.2 roundTrip总结
+
+![roundTrip总结](https://github.com/GenuineJyn/genuinejyn.github.io/blob/master/pictures/roundtrip.png)
+
+
+
+## 3 重试逻辑
+Transport.RoundTrip()最后提供了重试机制, 最后把这里说明一下，在实现网关的反向代理过程中，在RoundTrip外层加了重试逻辑，遇到了问题，顺便加以记录一下，在RoundTrip最后代码如下：
+
+```
+        if !pconn.shouldRetryRequest(req, err) {
+            // Issue 16465: return underlying net.Conn.Read error from peek,
+            // as we've historically done.
+            if e, ok := err.(transportReadFromServerError); ok {
+                err = e.err
+            }
+            return nil, err
+        }
+        testHookRoundTripRetried()
+
+        // Rewind the body if we're able to.  (HTTP/2 does this itself so we only
+        // need to do it for HTTP/1.1 connections.)
+        if req.GetBody != nil && pconn.alt == nil {
+            newReq := *req
+            var err error
+            newReq.Body, err = req.GetBody()
+            if err != nil {
+                return nil, err
+            }
+            req = &newReq
+        }
+```
+
+大致过程：shuldRetryRequest判断是否要重试，调用GetBody重新构造请求，返回循环重新执行。
 shuldRetryRequest中判断是否要对Request进行重试有很多分支，下面重点介绍几个，其他可以自己分析。
 
 ```
@@ -461,7 +508,7 @@ func (t *transferWriter) WriteBody(w io.Writer) error {
 	 ......
 }
 ```
-读过之后会关闭，当然这里是多态的形式，Body的具体类型可能是http.body, http.noBody(GET等请求)或者使用ioutil.NopCloser包装的ioutil.nopCloser类型等，所以这里得到并且标准库中也明确说明：***`client的Request.Body会被关闭`***。
+读过之后会关闭，当然这里是多态的形式，Body的具体类型可能是http.body, http.noBody(GET等请求)或者使用ioutil.NopCloser包装的类型等，所以这里得到并且标准库中也明确说明：***`client的Request.Body会被关闭`***。
 接下来看一下http.body的Read(), 毕竟是一个ReadCloser，也是Reader。
 
 ```
@@ -545,3 +592,5 @@ Or other NewRequest Method
 
 req.GetBody = getBody		
 ```
+
+代码看下来，思路比较清晰单细节很多，代码中有很多值得我们学习的地方：连接池，多goroutine协作，That's all。
