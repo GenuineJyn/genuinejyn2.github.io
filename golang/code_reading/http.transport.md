@@ -1,7 +1,7 @@
-# Golang标准库源码阅读 - http.Transport #
+# Golang标准库源码阅读 - net/http.Transport #
 
-最近实现网关的时候采用了http.Transport来实现了http协议反向代理，踩了一些坑，浪费了一些时间解决问题，最后下定决心要把源码好好看一下，并把遇到的问题及解决办法都加以记录一下。
-在使用net/http库发送http请求，无论是Client::Do等最后都会调用Transport的RoundTrip方法，Transport实现了RoundTripper接口，本文档会对Transport::RoundTrip做较详细的理解说明。
+最近实现网关的时候采用了http.Transport来实现了http协议反向代理，踩了一些坑，浪费了一些时间解决问题，最后下定决心要把源码好好看一下，并把部分遇涉及RoundTrip问题及解决办法加以记录。
+在使用net/http库发送http请求，包括net/http/client.go中提供的各种方法最后都会调用Transport的RoundTrip方法，Transport实现了RoundTripper接口，```RoundTripper is an interface representing the ability to execute a single HTTP transaction, obtaining the Response for a given Request.``` RoundTrip实现了一个http事务，返回指定请求的响应。
 
 ```
 type RoundTripper interface {
@@ -9,9 +9,12 @@ type RoundTripper interface {
 }
 ```
 
-首先，看一下Transport的数据结构
+接下来对Transport::RoundTrip做较详细的理解说明。
 
-```
+## 0. Prerequisite ##
+看一下Transport的数据结构
+
+```go
 type Transport struct {
     idleMu     sync.Mutex
     //注：在CloseIdleConnections()时，wantIdle会被置为true，关闭所有idleConn
@@ -22,10 +25,20 @@ type Transport struct {
 
     reqMu       sync.Mutex
     reqCanceler map[*Request]func(error)
+    
+    // DisableKeepAlives, if true, prevents re-use of TCP connections
+    // between different HTTP requests.
+    DisableKeepAlives bool
+    ......
+}
 ```
+0. go version go1.10.3 linux/amd64
+1. DisableKeepAlives 默认是false，使用长连接，注释中说明了设置为true，不会重用TCP链接
+2. Proxy的内部这里也不做过多介绍(socks5/http/https)
+3. RegisterProtocol可以注册新的协议scheme，相当于http协议上的一层协议，请求会转给注册scheme的RoundTripper而不走http的RoundTrip，具体使用可以参考标准库net/http/filetransport.go, net/http/h2_bundle.go有http/2的实现，https的内容涉及DialTLS的调用将会建立一个TLS的链接，这里不对https和http/2做过多介绍。
 
 ## 获取链接
-`getConn` 根据connectMethod获取或者创建一个*persistConn
+`getConn` 根据connectMethod获取或者创建一个\*persistConn, 连接池结构是这样的:idleConn map[connectMethodKey][]\*persistConn。其中connectMethodKey根据connectMethod生成的：`type connectMethodKey struct {proxy, scheme, addr string}`, map的值是一个*persistConn类型的slice结构，这里就是存放连接的地方，slice的length由MaxIdleConnsPerHost指定的，默认值为：`const DefaultMaxIdleConnsPerHost = 2`
 
 ```
 func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (*persistConn, error) { 
@@ -78,8 +91,8 @@ func (t *Transport) getIdleConn(cm connectMethod) (pconn *persistConn, idleSince
 }
 ```
 
-getIdleConn函数for死循环内根据connectMethod生成key获取t.idleConn满足条件的[]*persistConn，只有一条空闲链接的时候返回这一条链接，超过2条及以上，选取最近使用的一条（most recently used at end）
-选取之后并且返回使用之前还要检查这个链接是否已经中断了以及这条空闲链接中的定时器是否已经超时，如中断或者超时，continue重新在空闲连接池内再找一条。
+getIdleConn函数for死循环内根据connectMethod生成key获取t.idleConn(连接池)满足条件的[]*persistConn，只有一条空闲链接的时候返回这一条链接，超过2条及以上，选取最近使用的一条（most recently used at end），选取之后并且返回使用之前还要检查这个链接是否已经中断了以及这条空闲链接中的定时器是否已经超时，如中断或者超时，continue重新在空闲连接池内再找一条，上述代码大致的过程就是这样。
+
 如果getIdleConn获取到一个空闲链接，那么getConn函数将返回这个链接以供外面使用。如果没有获取到合适的空闲链接，那么接下来就需要创建一条新的链接。
 
 ###启动一个goroutine创建一个新的连接
@@ -90,7 +103,7 @@ getIdleConn函数for死循环内根据connectMethod生成key获取t.idleConn满�
         dialc <- dialRes{pc, err}
     }()
 ```
-t.dialConn中调用Transport::dial()，网络连接通过Dialer.DialContext创建，如果scheme为https，还会有TLS的一些初始化，如果是代理的形式还会有相关的操作，这里不做过多介绍。在dialConn最后有如下代码
+t.dialConn中调用Transport::dial()，网络连接通过Dialer.DialContext(注：Transport的注释中说明Dialer.Dial:Deprecated: Use DialContext instead)创建，如果scheme为https，还会有TLS的一些初始化，如果是代理的形式还会有相关的操作，这里不做过多介绍。在dialConn最后有如下代码:
 
 ```
     pconn.br = bufio.NewReader(pconn)
@@ -101,7 +114,7 @@ t.dialConn中调用Transport::dial()，网络连接通过Dialer.DialContext创�
 readLoop主要是读取从server返回的数据,writeLoop主要发送请求到server, 后续再详细介绍。
 创建后的连接发送到channel dialc中，等待接收。
 
-根据connectMethod获取对应的idleConnCh，如果不存在则创建一个空的idleConnCh，需要特别强调：**`DisableKeepAlives被置为true，idleConnCh逻辑都不生效`**。
+根据connectMethod获取对应的idleConnCh，如果不存在则创建一个空的idleConnCh，需要再一次强调：**`DisableKeepAlives被置为true，idleConnCh逻辑都不生效`**。
 
 接下利用select来处理建立链接过程当中的各种情况，如下5个case都是阻塞的channel在等待接受到来的值，整体阻塞在这里。
 
@@ -125,7 +138,7 @@ readLoop主要是读取从server返回的数据,writeLoop主要发送请求到se
 ```
 进入Block 1会做类似Block 3-5的判断；
 对于Block 3-5比较好理解，request被取消或者超时，返回相关错误。
-这里需要特别说明一下handlePendingDial，在select中的5个case中除了第一个外，其他的4个都需要调用它，`handlePendingDial`是一个Closure, 其中创建一个goroutine跟Block 1一样等待接收刚创建的连接，因为创建过程也在goroutine中完成，如果select多个case条件同时满足，会随机选取一个执行，例如走到Block 2搞到一个早前使用过的连接，如果有新的连接创建，不能浪费，也发送到idleConnCh中或者放到连接池，供别人使用，逻辑实现在`t.putOrCloseIdleConn(v.pc)`中，接下来重点来讲解一下, 代码如下：
+这里需要特别说明一下handlePendingDial，在select中的5个case中除了第一个外，其他的4个都需要调用它，`handlePendingDial`是一个Closure, 其中创建一个goroutine跟Block 1一样等待接收刚创建的连接，因为创建过程也在goroutine中完成，如果select多个case条件同时满足，会随机选取一个执行，例如走到Block 2搞到一个早前使用过的连接，如果有新的连接创建，不能浪费，也发送到idleConnCh中或者放到连接池，供后续使用，逻辑实现在`t.putOrCloseIdleConn(v.pc)`中，接下来重点来讲解一下, 代码如下：
 
 ```
     handlePendingDial := func() {
@@ -138,7 +151,7 @@ readLoop主要是读取从server返回的数据,writeLoop主要发送请求到se
         }()
     }
 ```
-putOrCloseIdleConn首先判断是不是persistConn是不是中断状态，如果是则调用close关闭，否则根据cacheKey(connectMethodKey)获取t.idleConnCh[key], 把自己发送到idleConnCh，参见之前讲到的接收的Block 2地方，如果idleConnCh被占用，则根据key把自己append到t.idleConn[key]slice尾部，t.idleLRU做调整，对于当前连接需要调整定时器超时时间，
+putOrCloseIdleConn首先判断是不是persistConn是不是中断状态，如果是则调用close关闭，否则根据cacheKey(connectMethodKey)获取t.idleConnCh[key], 把自己发送到idleConnCh，参见之前讲到的接收的Block 2地方，如果idleConnCh被占用，则根据key把自己append到t.idleConn[key]slice尾部（放到连接池），t.idleLRU做调整，对于当前连接需要调整定时器超时时间，
 
 ```
 pconn.idleTimer.Reset(t.IdleConnTimeout)
@@ -148,11 +161,16 @@ pconn.idleTimer.Reset(t.IdleConnTimeout)
 ```
 pconn.idleTimer = time.AfterFunc(t.IdleConnTimeout, pconn.closeConnIfStillIdle)
 ```
-如果超时时间已到没有被更新，则连接会被关闭。
+如果超时时间已到没有被更新，则连接会被关闭, 超时时间由IdleConnTimeout设定。
 
+```
+    // IdleConnTimeout is the maximum amount of time an idle (keep-alive) connection will remain idle before closing itself.
+    // Zero means no limit.
+    IdleConnTimeout time.Duration
+```
 整个获取链接的过程大致如下图所示。
 
-
+![getConn](https://github.com/GenuineJyn/genuinejyn.github.io/blob/master/pictures/getConn.png)
 
 ## 完成发送和接收通信过程 
 发送请求，接收响应在获取的连接上完成, 如下。在前面讲过创建每一个连接的时候同时启动了两个goroutine：readLoop和writeLoop，需要跟roundTrip通过管道配合完成。
