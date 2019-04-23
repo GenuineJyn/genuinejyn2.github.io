@@ -1,6 +1,6 @@
 Golang标准库源码阅读 - Context
 
-Context由Google官方在1.7版本中引入，在Golang并发编程中被广泛使用，在处理请求时更加方便地在goroutines中传递equest-scoped values, cancelation signals and deadlines，在golang使用过程中接触大量的context的使用，也踩过坑，从代码量上看去掉注释实现代码寥寥不多，似乎没有彻底明白context的设计精髓，广泛涉猎Context相关内容及源码阅读后加以整理以求能够合理和正确地使用context。
+Context由Google官方在1.7版本中引入，在Golang并发编程中被广泛使用，在处理请求时更加方便地在goroutines中传递request-scoped values, cancelation signals and deadlines，在golang使用过程中接触大量的context的使用，也踩过坑，从代码量上看去掉注释实现代码寥寥不多，似乎没有彻底明白context的设计精髓，广泛涉猎Context相关内容及源码阅读后加以整理以求能够合理和正确地使用context。
 
 本文主要涉及如下几个方面内容:
 
